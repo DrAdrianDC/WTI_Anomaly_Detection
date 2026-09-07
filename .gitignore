@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.python-version
+
+# Binary model weights (CSV, JSON and PNG reports in output_results/ are committed)
+output_results/*.keras
+output_results/*.pkl
+*.h5
+
+# Notebook / editor
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/

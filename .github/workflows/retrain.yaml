@@ -1,0 +1,60 @@
+# Weekly fine-tune of the WTI LSTM autoencoder.
+#
+# Cadence is Sunday 00:00 UTC on purpose. CL=F prints one bar per trading
+# day; a daily fine-tune adds ~1 point of signal, burns minutes, and
+# gives the quality gate more chances to flip on noise. Use
+# workflow_dispatch for the first activation after the Hub is seeded.
+name: Weekly WTI Retrain
+
+on:
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: wti-weekly-retrain
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  TF_CPP_MIN_LOG_LEVEL: "2"
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+jobs:
+  retrain:
+    name: Fine-tune and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Fine-tune champion model
+        run: python src/pipeline.py --mode retrain
+
+      - name: Hub upload status
+        run: |
+          if [ -z "${HF_TOKEN}" ]; then
+            echo "HF_TOKEN is not set. Retrain finished; Hub upload was skipped."
+            echo "Add the secret under Settings → Secrets to publish weights."
+          else
+            echo "HF_TOKEN is present. Pipeline uploaded on a passing gate."
+          fi
