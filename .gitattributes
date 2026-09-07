@@ -1,1 +1,7 @@
+# Marcar reportes y páginas HTML como generadas/documentación para que no alteren las estadísticas
+*.html linguist-vendored
+*.html linguist-generated
+*.html linguist-documentation
 
+# Ignorar archivos HTML dentro de carpetas específicas si las hay
+reports/*.html linguist-generated
