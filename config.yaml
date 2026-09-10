@@ -34,8 +34,12 @@ model:
   loss: "mse"
   optimizer: "adam"
   clipnorm: 1.0
-  # Anomaly threshold is the 90th percentile of per-window reconstruction MSE.
+  # Anomaly threshold is the 90th percentile of per-window reconstruction MSE
+  # on the original training split. That number is the decision policy.
   threshold_percentile: 90.0
+  # Locked after the original train. Weekly retrain and evaluate must not
+  # recompute it — a moving cutoff is a policy change, not a weight update.
+  frozen_threshold: 0.016175970621407035
 
 training:
   epochs: 100
@@ -48,11 +52,21 @@ retrain:
   epochs: 8
   patience: 3
   # Extra calendar days fetched before last_date so LSTM windows stay continuous.
+  # Fine-tune uses this window only. Published scores are append-only.
   context_days: 365
   # Champion/challenger: accept challenger if hold-out MAE does not degrade
   # more than this relative margin versus the current champion.
   max_degradation_ratio: 0.10
   min_sequences: 32
+  # Stress prints that must remain in the published score ledger.
+  # Retrain never recomputes these rows; it only appends newer dates.
+  acceptance_event_dates:
+    - "2008-10-10"   # GFC crash
+    - "2008-12-19"   # GFC trough
+    - "2016-01-15"   # 2014–16 glut
+    - "2020-03-09"   # OPEC+ price war
+    - "2020-04-20"   # negative WTI print
+    - "2022-03-08"   # Russia–Ukraine spike
 
 output_results:
   directory: "output_results"

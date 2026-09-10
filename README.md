@@ -108,7 +108,7 @@ huggingface:
 
 ## Operations
 
-A GitHub Actions workflow can run `python src/pipeline.py --mode retrain` on Sundays at 00:00 UTC. WTI adds one trading bar per session, so a daily retrain would add noise rather than information. Set the `HF_TOKEN` secret to publish; if it is absent, training still finishes and the job remains green. If the hold-out check fails, the previous model is left unchanged.
+A GitHub Actions workflow can run `python src/pipeline.py --mode retrain` on Sundays at 00:00 UTC. Fine-tune uses the last year of prices; the decision threshold stays frozen. New dates are appended to the published score ledger — historical flags (2008, 2016, 2020, 2022) are not recomputed. Plots always show the full ledger. Set the `HF_TOKEN` secret to publish; if it is absent, training still finishes and the job remains green.
 
 ## Data
 

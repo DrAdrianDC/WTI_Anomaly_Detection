@@ -33,6 +33,19 @@ def _as_path(value: str | Path) -> Path:
     return path
 
 
+def _as_date_tuple(value: Any) -> tuple[str, ...]:
+    """Normalize a YAML string or list of ISO dates into a tuple."""
+    if value is None or value == "":
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item) for item in value if item)
+    raise ConfigError(
+        "retrain.acceptance_event_dates must be a string or a list of strings."
+    )
+
+
 @dataclass(frozen=True)
 class DataConfig:
     ticker: str
@@ -65,6 +78,7 @@ class ModelConfig:
     optimizer: str
     clipnorm: float
     threshold_percentile: float
+    frozen_threshold: float | None
 
 
 @dataclass(frozen=True)
@@ -83,6 +97,7 @@ class RetrainConfig:
     context_days: int
     max_degradation_ratio: float
     min_sequences: int
+    acceptance_event_dates: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -211,6 +226,11 @@ def load_config(path: str | Path | None = None) -> AppConfig:
             threshold_percentile=float(
                 _require(model_raw, "threshold_percentile", "model")
             ),
+            frozen_threshold=(
+                None
+                if model_raw.get("frozen_threshold") is None
+                else float(model_raw["frozen_threshold"])
+            ),
         ),
         training=TrainingConfig(
             epochs=int(_require(train_raw, "epochs", "training")),
@@ -227,6 +247,10 @@ def load_config(path: str | Path | None = None) -> AppConfig:
                 _require(retrain_raw, "max_degradation_ratio", "retrain")
             ),
             min_sequences=int(_require(retrain_raw, "min_sequences", "retrain")),
+            acceptance_event_dates=_as_date_tuple(
+                retrain_raw.get("acceptance_event_dates")
+                or retrain_raw.get("acceptance_event_date")
+            ),
         ),
         output=output,
         huggingface=HuggingFaceConfig(

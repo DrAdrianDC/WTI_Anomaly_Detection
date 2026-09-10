@@ -10,13 +10,15 @@ Execution modes
     to the Hub.
 
 ``python src/pipeline.py --mode retrain``
-    Load the champion weights, pull the latest prices from the last
-    recorded date (plus a context window so LSTM sequences stay
-    continuous), fine-tune for a few epochs, and promote the challenger
+    Load the champion weights, fine-tune on the latest year, and promote
     only if hold-out MAE does not degrade beyond the configured margin.
+    The decision threshold stays frozen. New dates are **appended** to the
+    published score ledger; historical rows are never recomputed. Plots use
+    the full ledger.
 
 ``python src/pipeline.py --mode evaluate``
-    Reload the saved champion and write fresh CSV reports without training.
+    Append newly available dates to the published ledger with the frozen
+    threshold. Does not rewrite the past and does not train.
 """
 
 from __future__ import annotations
@@ -82,7 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="train: fit from scratch on full history. "
         "retrain: fine-tune the champion on the latest window. "
-        "evaluate: score the saved champion and refresh CSV reports.",
+        "evaluate: append new dates to the published ledger; do not rewrite history.",
     )
     parser.add_argument(
         "--config",
@@ -128,6 +130,186 @@ def _write_metadata(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
     logger.info("Wrote metadata to %s", path)
+
+
+def _decision_threshold(config: AppConfig, metadata: dict[str, Any]) -> float:
+    """Return the locked decision policy.
+
+    Weekly fine-tune may update weights. It must not move the cutoff. Prefer
+    ``config.model.frozen_threshold`` (policy as code) over Hub metadata, which
+    can be stale after a bad promote.
+    """
+    if config.model.frozen_threshold is not None:
+        return float(config.model.frozen_threshold)
+    raw = metadata.get("threshold")
+    if raw is None:
+        raise PipelineError(
+            "No frozen decision threshold. Set model.frozen_threshold in "
+            "config.yaml or run --mode train once."
+        )
+    return float(raw)
+
+
+def _score_full_series(
+    config: AppConfig,
+    autoencoder: LSTMAutoencoder,
+    preprocessor: TimeSeriesPreprocessor,
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Per-day reconstruction MSE and frozen-threshold flags for ``frame``."""
+    date_col = config.preprocessing.date_column
+    target_col = config.preprocessing.target_column
+    ordered = frame.sort_values(date_col).reset_index(drop=True)
+    sequences = preprocessor.transform(ordered)
+    errors = autoencoder.reconstruction_errors(sequences, metric="mse")
+    if autoencoder.threshold_ is None:
+        raise PipelineError("Decision threshold is not set; cannot flag windows.")
+    flags = (errors > autoencoder.threshold_).astype(int)
+    offset = preprocessor.lookback - 1
+    n_windows = len(errors)
+    return pd.DataFrame(
+        {
+            "Date": pd.to_datetime(
+                ordered[date_col].iloc[offset : offset + n_windows]
+            ).dt.strftime("%Y-%m-%d"),
+            "Close": ordered[target_col].iloc[offset : offset + n_windows].to_numpy(),
+            "reconstruction_mse": errors,
+            "anomaly": flags.astype(int),
+        }
+    )
+
+
+def _load_score_ledger(config: AppConfig) -> pd.DataFrame:
+    """Load the published score history. This file is append-only after train."""
+    path = config.output.scores_path
+    if not path.exists():
+        raise PipelineError(
+            f"Score ledger missing at {path}. Run --mode train once to create it. "
+            "Retrain must not rewrite history from scratch."
+        )
+    ledger = pd.read_csv(path)
+    required = {"Date", "Close", "reconstruction_mse", "anomaly"}
+    missing = required - set(ledger.columns)
+    if missing:
+        raise PipelineError(f"Score ledger is missing columns: {sorted(missing)}")
+    ledger["Date"] = pd.to_datetime(ledger["Date"]).dt.strftime("%Y-%m-%d")
+    ledger = ledger.drop_duplicates(subset=["Date"], keep="first")
+    ledger = ledger.sort_values("Date").reset_index(drop=True)
+    if ledger.empty:
+        raise PipelineError("Score ledger is empty.")
+    return ledger
+
+
+def _assert_ledger_events(ledger: pd.DataFrame, event_dates: tuple[str, ...]) -> None:
+    """Historical stress prints are a published record. They must stay in the ledger."""
+    if not event_dates:
+        return
+    indexed = ledger.set_index("Date")
+    missing = [day for day in event_dates if day not in indexed.index]
+    dropped = [
+        day
+        for day in event_dates
+        if day in indexed.index and int(indexed.loc[day, "anomaly"]) != 1
+    ]
+    if missing or dropped:
+        parts = []
+        if missing:
+            parts.append(f"missing from ledger {missing}")
+        if dropped:
+            parts.append(f"unflagged in ledger {dropped}")
+        raise PipelineError(
+            "Score ledger failed historical event integrity ("
+            + "; ".join(parts)
+            + ")."
+        )
+
+
+def _append_forward_scores(
+    config: AppConfig,
+    autoencoder: LSTMAutoencoder,
+    preprocessor: TimeSeriesPreprocessor,
+    ledger: pd.DataFrame,
+) -> pd.DataFrame:
+    """Score only dates after the ledger cutoff. Do not recompute the past.
+
+    The new champion is valid going forward. Published MSE/flags on historical
+    dates stay as they were written at train (or at the day they were appended).
+    """
+    last_scored = pd.to_datetime(ledger["Date"]).max()
+    calendar_buffer = max(40, int(preprocessor.lookback) * 4)
+    start = (last_scored - pd.Timedelta(days=calendar_buffer)).strftime("%Y-%m-%d")
+    logger.info(
+        "Scoring forward from %s (ledger ends %s).",
+        start,
+        last_scored.strftime("%Y-%m-%d"),
+    )
+    prices = _download(config, start=start)
+    scored = _score_full_series(config, autoencoder, preprocessor, prices)
+    new_rows = scored.loc[pd.to_datetime(scored["Date"]) > last_scored].copy()
+    if new_rows.empty:
+        logger.info("No new trading dates after %s.", last_scored.strftime("%Y-%m-%d"))
+        return ledger.copy()
+
+    combined = pd.concat([ledger, new_rows], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["Date"], keep="first")
+    combined = combined.sort_values("Date").reset_index(drop=True)
+    logger.info(
+        "Appended %s new dates (%s → %s). Historical rows left unchanged.",
+        len(new_rows),
+        new_rows["Date"].iloc[0],
+        new_rows["Date"].iloc[-1],
+    )
+    return combined
+
+
+def _write_score_artifacts(
+    config: AppConfig,
+    scores: pd.DataFrame,
+    metadata: dict[str, Any],
+    *,
+    history: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Write CSV + plots from a score ledger. Does not rescore."""
+    config.ensure_output_dir()
+    ordered = scores.sort_values("Date").reset_index(drop=True)
+    ordered["Date"] = pd.to_datetime(ordered["Date"]).dt.strftime("%Y-%m-%d")
+    detected = ordered.loc[ordered["anomaly"] == 1].copy()
+
+    ordered.to_csv(config.output.scores_path, index=False)
+    detected.to_csv(config.output.anomalies_path, index=False)
+    if history:
+        pd.DataFrame(history).to_csv(config.output.history_path, index=False)
+
+    metadata["n_windows_scored"] = int(len(ordered))
+    metadata["n_anomalies"] = int(detected.shape[0])
+    metadata["anomaly_rate"] = float(detected.shape[0] / len(ordered)) if len(ordered) else 0.0
+    if not detected.empty:
+        metadata["first_anomaly_date"] = str(detected["Date"].iloc[0])
+        metadata["last_anomaly_date"] = str(detected["Date"].iloc[-1])
+        peak_i = detected["reconstruction_mse"].astype(float).idxmax()
+        metadata["max_anomaly_mse"] = float(detected.loc[peak_i, "reconstruction_mse"])
+        metadata["max_anomaly_date"] = str(detected.loc[peak_i, "Date"])
+
+    plots = write_result_plots(
+        ordered,
+        price_plot=config.output.price_plot_path,
+        anomalies_plot=config.output.anomalies_plot_path,
+        reconstruction_plot=config.output.reconstruction_plot_path,
+        loss_plot=config.output.loss_plot_path,
+        anomalies_html=config.output.anomalies_html_path,
+        reconstruction_html=config.output.reconstruction_html_path,
+        threshold=metadata.get("threshold"),
+        history=history,
+    )
+    metadata["plots"] = {key: Path(value).name for key, value in plots.items()}
+    logger.info(
+        "Wrote %s (%s anomalies) covering %s → %s.",
+        config.output.scores_path.name,
+        metadata["n_anomalies"],
+        ordered["Date"].iloc[0],
+        ordered["Date"].iloc[-1],
+    )
+    return ordered
 
 
 def _build_autoencoder(config: AppConfig) -> LSTMAutoencoder:
@@ -202,6 +384,9 @@ def pull_artifacts_from_hub(config: AppConfig) -> bool:
         config.output.scaler_path.name,
         config.output.metadata_path.name,
     ]
+    # Do not pull CSV/plots from the Hub. Those are the append-only score
+    # ledger (usually committed in git). Overwriting them would let a stale
+    # Hub promote erase published history.
     recovered = False
     for filename in filenames:
         try:
@@ -281,64 +466,11 @@ def export_detection_report(
 ) -> pd.DataFrame:
     """Score the full series and write human-readable CSV reports.
 
-    Each sliding window is aligned to its last trading day so a row in
-    ``detected_anomalies.csv`` is a calendar date, not a tensor index.
+    Used by ``train`` only: that run *creates* the published ledger.
+    Retrain and evaluate append new dates and must not call this.
     """
-    config.ensure_output_dir()
-    date_col = config.preprocessing.date_column
-    target_col = config.preprocessing.target_column
-    ordered = frame.sort_values(date_col).reset_index(drop=True)
-    sequences = preprocessor.transform(ordered)
-    errors = autoencoder.reconstruction_errors(sequences, metric="mse")
-    flags = autoencoder.detect_anomalies(sequences)
-
-    offset = preprocessor.lookback - 1
-    n_windows = len(errors)
-    scores = pd.DataFrame(
-        {
-            "Date": ordered[date_col].iloc[offset : offset + n_windows].to_numpy(),
-            "Close": ordered[target_col].iloc[offset : offset + n_windows].to_numpy(),
-            "reconstruction_mse": errors,
-            "anomaly": flags.astype(int),
-        }
-    )
-    scores["Date"] = pd.to_datetime(scores["Date"]).dt.strftime("%Y-%m-%d")
-    detected = scores.loc[scores["anomaly"] == 1].copy()
-
-    scores.to_csv(config.output.scores_path, index=False)
-    detected.to_csv(config.output.anomalies_path, index=False)
-    if history:
-        pd.DataFrame(history).to_csv(config.output.history_path, index=False)
-
-    metadata["n_windows_scored"] = int(n_windows)
-    metadata["n_anomalies"] = int(flags.sum())
-    metadata["anomaly_rate"] = float(flags.mean())
-    if not detected.empty:
-        metadata["first_anomaly_date"] = str(detected["Date"].iloc[0])
-        metadata["last_anomaly_date"] = str(detected["Date"].iloc[-1])
-        metadata["max_anomaly_mse"] = float(detected["reconstruction_mse"].max())
-
-    plots = write_result_plots(
-        scores,
-        price_plot=config.output.price_plot_path,
-        anomalies_plot=config.output.anomalies_plot_path,
-        reconstruction_plot=config.output.reconstruction_plot_path,
-        loss_plot=config.output.loss_plot_path,
-        anomalies_html=config.output.anomalies_html_path,
-        reconstruction_html=config.output.reconstruction_html_path,
-        threshold=metadata.get("threshold"),
-        history=history,
-    )
-    metadata["plots"] = {key: Path(value).name for key, value in plots.items()}
-
-    logger.info(
-        "Wrote %s (%s anomalies), %s and %s.",
-        config.output.scores_path.name,
-        metadata["n_anomalies"],
-        config.output.anomalies_path.name,
-        config.output.anomalies_plot_path.name,
-    )
-    return scores
+    scores = _score_full_series(config, autoencoder, preprocessor, frame)
+    return _write_score_artifacts(config, scores, metadata, history=history)
 
 
 def _persist(
@@ -405,7 +537,12 @@ def run_train(
 
     val_mae = autoencoder.mean_absolute_error(x_val)
     train_mae = autoencoder.mean_absolute_error(x_train)
-    threshold = autoencoder.fit_threshold(x_train)
+    if config.model.frozen_threshold is not None:
+        threshold = float(config.model.frozen_threshold)
+        autoencoder.threshold_ = threshold
+        logger.info("Using frozen decision threshold %.6f (policy as code).", threshold)
+    else:
+        threshold = autoencoder.fit_threshold(x_train)
 
     metadata = {
         "mode": "train",
@@ -414,6 +551,7 @@ def run_train(
         "lookback": config.preprocessing.lookback,
         "scaler_type": config.preprocessing.scaler_type,
         "threshold": threshold,
+        "threshold_frozen": True,
         "threshold_percentile": config.model.threshold_percentile,
         "train_mae": train_mae,
         "val_mae": val_mae,
@@ -469,6 +607,10 @@ def run_retrain(
     5. Fine-tune a few epochs. Score the challenger on the same hold-out.
     6. Promote only if
        ``challenger_mae <= baseline_mae * (1 + max_degradation_ratio)``.
+    7. Keep the frozen decision threshold.
+    8. Append scores **only for dates after the published ledger**.
+       Historical rows (2008, 2020, …) are not recomputed.
+    9. Plots are drawn from the full ledger (frozen past + new tail).
     """
     set_global_seeds(config.training.seed)
     config.ensure_output_dir()
@@ -543,35 +685,42 @@ def run_retrain(
             f"> allowed {allowed:.6f}. Champion artifacts were not overwritten."
         )
 
-    threshold = champion.fit_threshold(x_tune)
+    threshold = _decision_threshold(config, metadata)
+    champion.threshold_ = threshold
+    logger.info("Decision threshold frozen at %.6f.", threshold)
+
+    ledger = _load_score_ledger(config)
+    _assert_ledger_events(ledger, config.retrain.acceptance_event_dates)
+    combined = _append_forward_scores(config, champion, preprocessor, ledger)
+
     updated = {
         **metadata,
         "mode": "retrain",
         "ticker": config.data.ticker,
-        "last_date": last_available_date(frame).strftime("%Y-%m-%d"),
+        "last_date": str(combined["Date"].iloc[-1]),
         "lookback": config.preprocessing.lookback,
         "scaler_type": preprocessor.scaler_type,
         "threshold": threshold,
+        "threshold_frozen": True,
         "threshold_percentile": config.model.threshold_percentile,
         "val_mae": challenger_mae,
         "baseline_mae": baseline_mae,
-        "n_train_windows": int(x_tune.shape[0]),
-        "n_val_windows": int(x_holdout.shape[0]),
+        "n_tune_windows": int(x_tune.shape[0]),
+        "n_holdout_windows": int(x_holdout.shape[0]),
         "best_val_loss": float(min(history.history.get("val_loss", [float("nan")]))),
         "epochs_trained": len(history.history.get("loss", [])),
         "trained_at": _iso_now(),
         "gate_passed": True,
+        "scores_mode": "append",
         "model": keras_model_to_dict(champion.model),
     }
-    _persist(
-        config,
-        champion,
-        preprocessor,
-        frame,
-        updated,
-        upload=upload,
-        history=history.history,
-    )
+    config.ensure_output_dir()
+    champion.save(config.output.model_path)
+    preprocessor.save_scaler(config.output.scaler_path)
+    _write_score_artifacts(config, combined, updated, history=history.history)
+    _write_metadata(config.output.metadata_path, updated)
+    if upload:
+        push_artifacts_to_hub(config)
     logger.info(
         "Retrain promoted. val_mae=%.6f (was %.6f) last_date=%s",
         challenger_mae,
@@ -581,44 +730,41 @@ def run_retrain(
     return updated
 
 
-def run_evaluate(config: AppConfig) -> dict[str, Any]:
-    """Reload the champion and refresh CSV reports on the latest history."""
+def run_evaluate(config: AppConfig, *, upload: bool = False) -> dict[str, Any]:
+    """Append newly available dates to the published ledger. Do not rescore the past."""
     if not config.output.model_path.exists() or not config.output.scaler_path.exists():
         raise PipelineError(
             "evaluate requires a saved model and scaler. "
             "Run `python src/pipeline.py --mode train` first."
         )
 
-    frame = _download(config)
     preprocessor = TimeSeriesPreprocessor.load_scaler(config.output.scaler_path)
     preprocessor.lookback = config.preprocessing.lookback
     metadata = _read_metadata(config.output.metadata_path)
+    threshold = _decision_threshold(config, metadata)
     autoencoder = LSTMAutoencoder.load(
         config.output.model_path,
         threshold_percentile=config.model.threshold_percentile,
-        threshold=metadata.get("threshold"),
+        threshold=threshold,
     )
-    if autoencoder.threshold_ is None:
-        sequences = preprocessor.transform(frame)
-        autoencoder.fit_threshold(sequences)
-        metadata["threshold"] = autoencoder.threshold_
+
+    ledger = _load_score_ledger(config)
+    _assert_ledger_events(ledger, config.retrain.acceptance_event_dates)
+    combined = _append_forward_scores(config, autoencoder, preprocessor, ledger)
 
     metadata["mode"] = "evaluate"
-    metadata["last_date"] = last_available_date(frame).strftime("%Y-%m-%d")
+    metadata["threshold"] = threshold
+    metadata["threshold_frozen"] = True
+    metadata["scores_mode"] = "append"
+    metadata["last_date"] = str(combined["Date"].iloc[-1])
     metadata["evaluated_at"] = _iso_now()
     history = None
     if config.output.history_path.exists():
         history = pd.read_csv(config.output.history_path).to_dict(orient="list")
-    _persist(
-        config,
-        autoencoder,
-        preprocessor,
-        frame,
-        metadata,
-        upload=False,
-        save_model=False,
-        history=history,
-    )
+    _write_score_artifacts(config, combined, metadata, history=history)
+    _write_metadata(config.output.metadata_path, metadata)
+    if upload:
+        push_artifacts_to_hub(config)
     logger.info(
         "Evaluation complete. n_anomalies=%s last_date=%s",
         metadata.get("n_anomalies"),
@@ -645,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.mode == "retrain":
             run_retrain(config, upload=not args.skip_upload, epochs=args.epochs)
         else:
-            run_evaluate(config)
+            run_evaluate(config, upload=not args.skip_upload)
     except QualityGateRejected as exc:
         # A rejected challenger is an expected weekly outcome, not a CI outage.
         logger.warning("%s", exc)

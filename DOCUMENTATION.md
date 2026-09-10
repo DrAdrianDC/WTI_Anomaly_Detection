@@ -91,14 +91,17 @@ This is the path GitHub Actions runs every Sunday.
 8. Promote only if  
    `challenger_mae <= baseline_mae * (1 + max_degradation_ratio)`  
    with `max_degradation_ratio = 0.10`.
-9. On promote: overwrite `.keras` (scaler unchanged), recompute threshold, rewrite reports and plots, upload.
-10. On reject: raise `QualityGateRejected`. Disk is not overwritten. Process exits 0 so CI does not treat a conservative keep as an outage.
+9. Keep the **frozen** decision threshold (`model.frozen_threshold`). Do not call `fit_threshold` on the recent window.
+10. Load the published score ledger (`reconstruction_scores.csv`). Historical rows are **not** recomputed. Assert the configured stress dates are still present and flagged in that ledger.
+11. Score **only dates after the ledger cutoff** with the new weights. Append those rows.
+12. On promote: overwrite `.keras` (scaler and threshold unchanged), rewrite plots from the **full ledger** (frozen past + new tail), upload.
+13. On reject: raise `QualityGateRejected`. Disk is not overwritten. Process exits 0 so CI does not treat a conservative keep as an outage.
 
-The gate compares both models on the **same** recent hold-out. Comparing a new MAE to a stale MAE from a different period is not a gate.
+The MAE gate compares both models on the **same** recent hold-out. The published history does not move. A weekly job must not rewrite 2008 or 2020 because the weights changed.
 
 ### 3. `evaluate` — reports only
 
-Loads the champion and scaler, downloads the latest full history, scores, and rewrites CSVs and plots. Weights are not saved. Use this after a config change that only affects reporting, or to refresh figures for the README.
+Loads the champion and scaler, **appends** newly available dates to the published score ledger with the frozen threshold, and refreshes plots from that full ledger. Historical rows are not rewritten. Weights are not saved.
 
 ---
 
@@ -135,9 +138,9 @@ Single source of runtime truth. Training, retraining, evaluate and CI all read t
 | --- | --- |
 | `data` | Ticker `CL=F`, yfinance period, optional ISO date bounds, chronological split, null-ratio cap, download retries |
 | `preprocessing` | `scaler_type` (`robust` / `minmax` / `standard`), `lookback` (10), column names |
-| `model` | LSTM widths, dropout, activation, loss, Adam `clipnorm`, `threshold_percentile` |
+| `model` | LSTM widths, dropout, activation, loss, Adam `clipnorm`, `threshold_percentile`, **`frozen_threshold`** (decision policy; retrain must not change it) |
 | `training` | Max epochs (100), batch size (32), patience (10), seed, shuffle (false) |
-| `retrain` | Fine-tune epochs (8), patience (3), `context_days` (365), `max_degradation_ratio` (0.10), `min_sequences` |
+| `retrain` | Fine-tune epochs (8), patience (3), `context_days` (365), `max_degradation_ratio` (0.10), `min_sequences`, `acceptance_event_dates` |
 | `output_results` | Directory and every output filename |
 | `huggingface` | `repo_id`, `repo_type`, `private` |
 
@@ -285,7 +288,7 @@ Review and runtime folder. Produced by `train`, `retrain` (on promote) and `eval
 
 `.keras` and `.pkl` are gitignored (binaries). CSV, JSON and PNG are intended to be committed so the README renders on GitHub.
 
-`metadata.json` fields used by the next `retrain`: `last_date`, `threshold`, `val_mae`.
+`metadata.json` fields used by the next `retrain`: `last_date` (download window). The decision threshold is `model.frozen_threshold` in `config.yaml`, not a weekly Hub field.
 
 ### `.github/workflows/retrain.yaml`
 
@@ -320,10 +323,12 @@ Ignores `.venv/`, `__pycache__/`, `.keras` / `.pkl` under `output_results/`, and
 - **Series:** unadjusted daily Close of `CL=F`.
 - **Window:** 10 consecutive trading days (yfinance already drops weekends).
 - **Alignment:** window `i` uses rows `[i, i+10)` and is assigned to the date of row `i+9`.
-- **Threshold:** `percentile(train_mse, 90)`. Applied at inference to the full scored series.
-- **Gate metric:** mean MAE on the hold-out windows, not MSE. MAE is the quantity compared across champion and challenger.
+- **Threshold:** `percentile(train_mse, 90)` computed **once** at train time and stored as `model.frozen_threshold`. Applied at inference to **new** dates. Weekly fine-tune does not move it.
+- **Gate metric:** mean MAE on the recent hold-out windows, not MSE. MAE is the quantity compared across champion and challenger.
+- **Score ledger:** `reconstruction_scores.csv` is append-only after the original train. Retrain/evaluate score only dates after the last published row. Plots always render the full ledger, so 2008 and 2020 do not jump week to week.
+- **Event integrity:** `acceptance_event_dates` must remain present and flagged **in the ledger**. That is a check on the published record, not a rescore of the past with new weights.
 
-April 2020 (negative print), 2008, 2015–2016 and March 2022 are the qualitative acceptance set. If a new champion loses 20 April 2020 as the top error, treat that as a regression even if MAE improved.
+April 2020 (negative print), 2008, 2015–2016 and March 2022 are the qualitative acceptance set. The first of those is enforced in code.
 
 ---
 
