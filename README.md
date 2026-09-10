@@ -6,8 +6,7 @@ The network is trained to reconstruct ten-day windows of scaled closing prices. 
 
 Data are downloaded from Yahoo Finance. Training, scoring and figures are driven from the command line; outputs land in `output_results/`. Optional weekly fine-tuning can publish a new model to the Hugging Face Hub only if hold-out error does not deteriorate beyond a fixed margin.
 
-Further reading: [DOCUMENTATION.md](DOCUMENTATION.md) (modules and workflow), [PLAYBOOK.md](PLAYBOOK.md) (GitHub and Hub).
-
+Further reading: [DOCUMENTATION.md](DOCUMENTATION.md) (modules and workflow).
 ## Results
 
 Closing price with days above the error threshold:
